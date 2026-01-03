@@ -1,0 +1,27 @@
+{
+  "name": "ktool-video-robot-backend",
+  "version": "1.0.0",
+  "description": "Backend for K-TOOL Video Robot AI - Automated Video Generation",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [
+    "gemini-ai",
+    "video-generator",
+    "ktool",
+    "automation"
+  ],
+  "author": "K-TOOL ID",
+  "license": "ISC",
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "uuid": "^11.0.3",
+    "ytdl-core": "^4.11.5",
+    "fluent-ffmpeg": "^2.1.3"
+  }
+}
