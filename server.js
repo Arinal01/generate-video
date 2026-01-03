@@ -9,26 +9,28 @@ const fs = require('fs');
 dotenv.config();
 const app = express();
 
-// PERBAIKAN CORS: Izinkan domain ktool.biz.id
+// PERBAIKAN CORS: Pastikan semua varian domain diizinkan
 app.use(cors({
-    origin: ['https://www.ktool.biz.id', 'https://ktool.biz.id'],
+    origin: ['https://www.ktool.biz.id', 'https://ktool.biz.id', 'http://ktool.biz.id', 'http://www.ktool.biz.id'],
     methods: ['GET', 'POST'],
     credentials: true
 }));
 
 app.use(express.json());
 
-// Inisialisasi Gemini AI
+// Verifikasi API Key di Log Railway
+if (!process.env.GEMINI_API_KEY) {
+    console.error("ERROR: GEMINI_API_KEY tidak ditemukan di Variables Railway!");
+}
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Media Directories
 const OUTPUT_DIR = path.join(__dirname, 'output');
 if (!fs.existsSync(OUTPUT_DIR)) {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 }
 app.use('/output', express.static(OUTPUT_DIR));
 
-// 1. ENDPOINT AI WRITER
 app.post('/api/video-robot/ai-writer', async (req, res) => {
     const { keyword } = req.body;
     try {
@@ -46,11 +48,10 @@ app.post('/api/video-robot/ai-writer', async (req, res) => {
         res.json({ success: true, title: data.title, content: data.content });
     } catch (error) {
         console.error("AI Writer Error:", error);
-        res.status(500).json({ success: false, error: "Gagal membuat konten otomatis." });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// 2. ENDPOINT PROSES VIDEO
 app.post('/api/video-robot/process', async (req, res) => {
     const { sourceType, title, content, youtubeUrl, duration, subtitle } = req.body;
     const jobId = uuidv4();
@@ -78,7 +79,6 @@ app.post('/api/video-robot/process', async (req, res) => {
     }
 });
 
-// 3. DAFTAR SEMUA MODEL GEMINI
 const AVAILABLE_MODELS = [
     "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash-exp", "gemini-2.0-flash", 
     "gemini-2.0-flash-001", "gemini-2.0-flash-exp-image-generation", "gemini-2.0-flash-lite-001", 
@@ -93,7 +93,6 @@ const AVAILABLE_MODELS = [
     "gemini-2.5-computer-use-preview-10-2025", "deep-research-pro-preview-12-2025"
 ];
 
-// PERBAIKAN PORT: Railway akan otomatis mengisi process.env.PORT
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Backend Robot Video berjalan di Port: ${PORT}`);
