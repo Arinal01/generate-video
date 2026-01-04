@@ -24,18 +24,20 @@ app.use(cors({
 
 app.use(express.json());
 
+// Menggunakan path absolut untuk Railway/VPS
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const TEMP_DIR = path.join(__dirname, 'temp'); 
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
+// Menyajikan file statis dari folder output
 app.use('/output', express.static(OUTPUT_DIR));
 
 // ==========================================
 // DAFTAR MODEL LENGKAP (K-TOOL ID)
 // ==========================================
 const AVAILABLE_MODELS = [
-    "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash-exp", "gemini-2.0-flash", 
+    "gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash-exp", 
     "gemini-2.0-flash-001", "gemini-2.0-flash-exp-image-generation", "gemini-2.0-flash-lite-001", 
     "gemini-2.0-flash-lite", "gemini-2.0-flash-lite-preview-02-05", "gemini-2.0-flash-lite-preview", 
     "gemini-exp-1206", "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts", 
@@ -60,7 +62,8 @@ async function getFootageUrl(query) {
             headers: { Authorization: PEXELS_API_KEY }
         });
         if (res.data.videos && res.data.videos.length > 0) {
-            const videoFile = res.data.videos[0].video_files.find(f => f.quality === 'hd') || res.data.videos[0].video_files[0];
+            // Pilih file dengan resolusi yang masuk akal untuk render cepat
+            const videoFile = res.data.videos[0].video_files.find(f => f.width >= 1280 && f.width <= 1920) || res.data.videos[0].video_files[0];
             return videoFile.link;
         }
     } catch (e) { console.error("Pexels Error:", e.message); }
@@ -68,7 +71,7 @@ async function getFootageUrl(query) {
 }
 
 // ==========================================
-// LOGIKA FAILOVER
+// LOGIKA FAILOVER DENGAN JEDA ANTI 429
 // ==========================================
 async function generateWithFailover(prompt, useJson = false) {
     for (const modelName of AVAILABLE_MODELS) {
@@ -79,19 +82,21 @@ async function generateWithFailover(prompt, useJson = false) {
             let text = response.text();
             
             if (useJson) {
+                // Bersihkan karakter aneh yang sering muncul di response AI
                 text = text.replace(/```json|```/g, '').trim();
                 return JSON.parse(text);
             }
             return text;
         } catch (error) {
+            console.log(`Model ${modelName} gagal: ${error.message}`);
             if (error.status === 429 || error.message.includes('429')) {
-                await sleep(2000); 
+                await sleep(5000); // Jeda lebih lama jika kena rate limit
                 continue;
             }
             continue;
         }
     }
-    throw new Error("Semua model AI sedang limit.");
+    throw new Error("Semua model AI sedang limit atau kuota habis.");
 }
 
 // ==========================================
@@ -103,8 +108,8 @@ app.post('/api/video-robot/ai-writer', async (req, res) => {
     try {
         const prompt = `Anda adalah penulis konten viral. Berdasarkan kata kunci "${keyword}", buatlah:
         1. Judul video clickbait.
-        2. Narasi pembahasan panjang (sesuaikan untuk durasi menit).
-        3. Kata kunci pencarian video footage (1-2 kata inggris).
+        2. Narasi pembahasan panjang untuk durasi video.
+        3. Kata kunci pencarian video footage dalam 1 kata bahasa Inggris (contoh: 'tech', 'forest', 'city').
         Format output JSON: {"title": "...", "content": "...", "footage_keyword": "..."}`;
         
         const data = await generateWithFailover(prompt, true);
@@ -123,42 +128,51 @@ app.post('/api/video-robot/process', async (req, res) => {
     const imageFallbackPath = path.join(TEMP_DIR, `fallback_${jobId}.jpg`);
 
     try {
-        // 1. GENERATE SUARA (AI VOICE) - Menggunakan gTTS (Google TTS)
-        const ttsCmd = `gtts-cli "${content.substring(0, 1000)}" --lang id --output ${audioPath}`;
+        // 1. GENERATE SUARA (Limit teks agar gTTS tidak error)
+        const safeText = content.substring(0, 1000).replace(/["']/g, "");
+        const ttsCmd = `gtts-cli "${safeText}" --lang id --output ${audioPath}`;
         
         exec(ttsCmd, async (ttsErr) => {
+            if (ttsErr) console.error("TTS Error:", ttsErr);
+            
             const finalAudio = fs.existsSync(audioPath) ? audioPath : null;
 
-            // 2. CARI FOOTAGE / BUAT FALLBACK GAMBAR
+            // 2. CARI FOOTAGE
             let videoLink = await getFootageUrl(footage_keyword || title);
             let inputSource = "";
 
             if (videoLink) {
-                inputSource = `-i "${videoLink}"`;
+                inputSource = `-re -i "${videoLink}"`; // -re membantu stabilitas streaming URL
             } else {
-                const createImgCmd = `ffmpeg -f lavfi -i color=c=0x1e293b:s=1280x720:d=1 -vf "drawtext=text='${title}':fontcolor=white:fontsize=50:x=(w-text_w)/2:y=(h-text_h)/2" -frames:v 1 ${imageFallbackPath}`;
+                const createImgCmd = `ffmpeg -f lavfi -i color=c=0x1e293b:s=1280x720:d=1 -vf "drawtext=text='${title.substring(0,20)}':fontcolor=white:fontsize=50:x=(w-text_w)/2:y=(h-text_h)/2" -frames:v 1 ${imageFallbackPath}`;
                 await new Promise(resolve => exec(createImgCmd, resolve));
                 inputSource = `-loop 1 -i ${imageFallbackPath}`;
             }
 
-            // 3. LOGIKA OVERLAY (Judul di awal + Subtitle)
-            let vfChain = `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2`;
-            vfChain += `,drawtext=text='${title}':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,0,5)'`;
+            // 3. LOGIKA OVERLAY & RENDER (Disederhanakan untuk mencegah Render Error)
+            const videoDuration = duration || 30;
+            const audioInput = finalAudio ? `-i ${finalAudio}` : `-f lavfi -i anullsrc=r=44100:cl=stereo`;
             
+            // Filter: Scale, Pad, Overlay Title, dan Subtitle sederhana
+            let filters = `scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1`;
             if (subtitle) {
-                const cleanSub = content.substring(0, 80).replace(/'/g, "").replace(/"/g, "");
-                vfChain += `,drawtext=text='${cleanSub}...':fontcolor=yellow:fontsize=32:x=(w-text_w)/2:y=h-120:box=1:boxcolor=black@0.6:boxborderw=10:enable='gt(t,5)'`;
+                const cleanSub = content.substring(0, 60).replace(/[:']/g, "");
+                filters += `,drawtext=text='${cleanSub}...':fontcolor=yellow:fontsize=30:x=(w-text_w)/2:y=h-100:box=1:boxcolor=black@0.5`;
             }
 
-            // 4. RENDER FINAL
-            const audioInput = finalAudio ? `-i ${finalAudio}` : `-f lavfi -i anullsrc=r=44100:cl=stereo`;
-            const ffmpegCmd = `ffmpeg -t ${duration || 60} ${inputSource} ${audioInput} -vf "${vfChain}" -c:v libx264 -c:a aac -map 0:v:0 -map 1:a:0 -shortest -pix_fmt yuv420p ${videoPath}`;
+            // Command FFmpeg yang lebih stabil untuk Railway (Encoding libx264)
+            const ffmpegCmd = `ffmpeg -t ${videoDuration} ${inputSource} ${audioInput} -vf "${filters}" -c:v libx264 -preset superfast -tune zerolatency -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest -pix_fmt yuv420p -y ${videoPath}`;
 
-            exec(ffmpegCmd, (err) => {
+            console.log("Memulai Render...");
+            exec(ffmpegCmd, (err, stdout, stderr) => {
+                // Cleanup temp files
                 if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
                 if (fs.existsSync(imageFallbackPath)) fs.unlinkSync(imageFallbackPath);
 
-                if (err) return res.status(500).json({ success: false, error: "Render Error" });
+                if (err) {
+                    console.error("FFmpeg Error:", stderr);
+                    return res.status(500).json({ success: false, error: "Render Error: Pastikan FFmpeg & gTTS terinstal." });
+                }
 
                 const protocol = req.headers['x-forwarded-proto'] || 'http';
                 const host = req.get('host');
@@ -174,6 +188,18 @@ app.post('/api/video-robot/process', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// Auto-delete file lama (> 1 jam) agar storage tidak penuh
+setInterval(() => {
+    fs.readdir(OUTPUT_DIR, (err, files) => {
+        if (err) return;
+        files.forEach(file => {
+            const filePath = path.join(OUTPUT_DIR, file);
+            const stats = fs.statSync(filePath);
+            if (Date.now() - stats.mtimeMs > 3600000) fs.unlinkSync(filePath);
+        });
+    });
+}, 600000);
 
 app.get('/', (req, res) => res.send("K-TOOL VIDEO ROBOT PRO ACTIVE"));
 
