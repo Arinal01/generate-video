@@ -5,14 +5,17 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
+const { exec } = require('child_process');
 const axios = require('axios');
 
 dotenv.config();
 const app = express();
 
 // ==========================================
-// KONFIGURASI CORS & DIRECTORY
+// KONFIGURASI & API KEYS (K-TOOL ID)
 // ==========================================
+const PEXELS_API_KEY = process.env.PEXELS_API_KEY || "YCP7fcbOscx60mAhTbsd1JVdUcX6zpmpQyZoIUFF3F6mFQthLXhq76YS";
+
 app.use(cors({
     origin: ['https://www.ktool.biz.id', 'https://ktool.biz.id', 'http://ktool.biz.id', 'http://www.ktool.biz.id'],
     methods: ['GET', 'POST'],
@@ -22,13 +25,14 @@ app.use(cors({
 app.use(express.json());
 
 const OUTPUT_DIR = path.join(__dirname, 'output');
-if (!fs.existsSync(OUTPUT_DIR)) {
-    fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-}
+const TEMP_DIR = path.join(__dirname, 'temp'); 
+if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+
 app.use('/output', express.static(OUTPUT_DIR));
 
 // ==========================================
-// DAFTAR MODEL LENGKAP (IDENTITAS K-TOOL)
+// DAFTAR MODEL LENGKAP (K-TOOL ID)
 // ==========================================
 const AVAILABLE_MODELS = [
     "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash-exp", "gemini-2.0-flash", 
@@ -44,16 +48,27 @@ const AVAILABLE_MODELS = [
     "gemini-2.5-computer-use-preview-10-2025", "deep-research-pro-preview-12-2025"
 ];
 
-// Verifikasi API Key
-if (!process.env.GEMINI_API_KEY) {
-    console.error("ERROR: GEMINI_API_KEY tidak ditemukan di Variables Railway!");
-}
-
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ==========================================
-// LOGIKA FAILOVER (PENGGANTI MODEL JIKA LIMIT)
+// FUNGSI PENCARI VIDEO FOOTAGE (PEXELS)
+// ==========================================
+async function getFootageUrl(query) {
+    try {
+        const res = await axios.get(`https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=1`, {
+            headers: { Authorization: PEXELS_API_KEY }
+        });
+        if (res.data.videos && res.data.videos.length > 0) {
+            const videoFile = res.data.videos[0].video_files.find(f => f.quality === 'hd') || res.data.videos[0].video_files[0];
+            return videoFile.link;
+        }
+    } catch (e) { console.error("Pexels Error:", e.message); }
+    return null;
+}
+
+// ==========================================
+// LOGIKA FAILOVER
 // ==========================================
 async function generateWithFailover(prompt, useJson = false) {
     for (const modelName of AVAILABLE_MODELS) {
@@ -70,15 +85,13 @@ async function generateWithFailover(prompt, useJson = false) {
             return text;
         } catch (error) {
             if (error.status === 429 || error.message.includes('429')) {
-                console.warn(`Model ${modelName} limit (429), mencoba model berikutnya...`);
-                await sleep(1500); // Jeda singkat agar tidak spamming
+                await sleep(2000); 
                 continue;
             }
-            console.error(`Error pada model ${modelName}:`, error.message);
             continue;
         }
     }
-    throw new Error("Semua model AI sedang limit atau tidak tersedia.");
+    throw new Error("Semua model AI sedang limit.");
 }
 
 // ==========================================
@@ -89,50 +102,83 @@ app.post('/api/video-robot/ai-writer', async (req, res) => {
     const { keyword } = req.body;
     try {
         const prompt = `Anda adalah penulis konten viral. Berdasarkan kata kunci "${keyword}", buatlah:
-        1. Judul video yang sangat clickbait dan menarik.
-        2. Isi konten pembahasan yang sangat detail, edukatif, dan panjang untuk narasi video.
-        Format output WAJIB JSON murni: {"title": "...", "content": "..."}`;
+        1. Judul video clickbait.
+        2. Narasi pembahasan panjang (sesuaikan untuk durasi menit).
+        3. Kata kunci pencarian video footage (1-2 kata inggris).
+        Format output JSON: {"title": "...", "content": "...", "footage_keyword": "..."}`;
         
         const data = await generateWithFailover(prompt, true);
-        res.json({ success: true, title: data.title, content: data.content });
+        res.json({ success: true, ...data });
     } catch (error) {
-        console.error("AI Writer Error:", error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
 app.post('/api/video-robot/process', async (req, res) => {
-    const { sourceType, title, content, youtubeUrl, duration, subtitle } = req.body;
+    const { title, content, duration, subtitle, footage_keyword } = req.body;
     const jobId = uuidv4();
+    const videoFileName = `ktool_v_${jobId}.mp4`;
+    const videoPath = path.join(OUTPUT_DIR, videoFileName);
+    const audioPath = path.join(TEMP_DIR, `audio_${jobId}.mp3`);
+    const imageFallbackPath = path.join(TEMP_DIR, `fallback_${jobId}.jpg`);
 
     try {
-        let finalPrompt = "";
-        if (sourceType === 'youtube') {
-            finalPrompt = `Analisis video YouTube ini: ${youtubeUrl}. Buat ulang dengan narasi baru.`;
-        } else {
-            finalPrompt = `Buat konsep video profesional durasi ${duration}s. Judul: ${title}. Isi: ${content}.`;
-        }
-
-        const aiResponse = await generateWithFailover(finalPrompt);
+        // 1. GENERATE SUARA (AI VOICE) - Menggunakan gTTS (Google TTS)
+        const ttsCmd = `gtts-cli "${content.substring(0, 1000)}" --lang id --output ${audioPath}`;
         
-        const videoFileName = `ktool_v_${jobId}.mp4`;
-        const protocol = req.headers['x-forwarded-proto'] || 'http';
-        const host = req.get('host');
-        const videoUrl = `${protocol}://${host}/output/${videoFileName}`;
+        exec(ttsCmd, async (ttsErr) => {
+            const finalAudio = fs.existsSync(audioPath) ? audioPath : null;
 
-        // Simulasi sukses karena proses render video sebenarnya membutuhkan FFmpeg/Service lain
-        res.json({ success: true, videoUrl: videoUrl, jobId: jobId, aiAnalysis: aiResponse });
+            // 2. CARI FOOTAGE / BUAT FALLBACK GAMBAR
+            let videoLink = await getFootageUrl(footage_keyword || title);
+            let inputSource = "";
+
+            if (videoLink) {
+                inputSource = `-i "${videoLink}"`;
+            } else {
+                const createImgCmd = `ffmpeg -f lavfi -i color=c=0x1e293b:s=1280x720:d=1 -vf "drawtext=text='${title}':fontcolor=white:fontsize=50:x=(w-text_w)/2:y=(h-text_h)/2" -frames:v 1 ${imageFallbackPath}`;
+                await new Promise(resolve => exec(createImgCmd, resolve));
+                inputSource = `-loop 1 -i ${imageFallbackPath}`;
+            }
+
+            // 3. LOGIKA OVERLAY (Judul di awal + Subtitle)
+            let vfChain = `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2`;
+            vfChain += `,drawtext=text='${title}':fontcolor=white:fontsize=60:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,0,5)'`;
+            
+            if (subtitle) {
+                const cleanSub = content.substring(0, 80).replace(/'/g, "").replace(/"/g, "");
+                vfChain += `,drawtext=text='${cleanSub}...':fontcolor=yellow:fontsize=32:x=(w-text_w)/2:y=h-120:box=1:boxcolor=black@0.6:boxborderw=10:enable='gt(t,5)'`;
+            }
+
+            // 4. RENDER FINAL
+            const audioInput = finalAudio ? `-i ${finalAudio}` : `-f lavfi -i anullsrc=r=44100:cl=stereo`;
+            const ffmpegCmd = `ffmpeg -t ${duration || 60} ${inputSource} ${audioInput} -vf "${vfChain}" -c:v libx264 -c:a aac -map 0:v:0 -map 1:a:0 -shortest -pix_fmt yuv420p ${videoPath}`;
+
+            exec(ffmpegCmd, (err) => {
+                if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+                if (fs.existsSync(imageFallbackPath)) fs.unlinkSync(imageFallbackPath);
+
+                if (err) return res.status(500).json({ success: false, error: "Render Error" });
+
+                const protocol = req.headers['x-forwarded-proto'] || 'http';
+                const host = req.get('host');
+                res.json({ 
+                    success: true, 
+                    videoUrl: `${protocol}://${host}/output/${videoFileName}`,
+                    jobId: jobId 
+                });
+            });
+        });
+
     } catch (error) {
-        console.error("Robot Process Error:", error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Root check
-app.get('/', (req, res) => res.send("K-TOOL VIDEO ROBOT BACKEND IS LIVE (RAILWAY)"));
+app.get('/', (req, res) => res.send("K-TOOL VIDEO ROBOT PRO ACTIVE"));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Backend Robot Video berjalan di Port: ${PORT}`);
+    console.log(`Server K-TOOL Aktif: ${PORT}`);
 });
 
